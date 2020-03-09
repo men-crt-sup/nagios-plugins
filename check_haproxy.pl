@@ -1,6 +1,7 @@
 #!/usr/bin/perl -w
 #
 # Copyright (c) 2010 Stéphane Urbanovski <stephane.urbanovski@ac-nancy-metz.fr>
+# Copyright (c) 2019 Claudio Kuenzler <ck@claudiokuenzler.com>
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -30,18 +31,40 @@ use POSIX qw(setlocale);
 use Time::HiRes qw(time);			# get microtime
 use POSIX qw(mktime);
 
-use Nagios::Plugin ;
+sub load_module {
+    my @names = @_;
+    my $module;
+    for my $name (@names) {
+        my $file = $name;
+        # requires need either a bare word or a file name
+        $file =~ s{::}{/}gsxm;
+        $file .= '.pm';
+        eval {
+            require $file;
+            $name->import();
+            $module = $name;
+		};
+		last if $module;
+    }
+    return $module;
+}
+
+my $plugin_module;
+BEGIN {
+	$plugin_module = load_module( 'Monitoring::Plugin', 'Nagios::Plugin' );
+}
 
 use LWP::UserAgent;			# http client
 use HTTP::Request;			# used by LWP::UserAgent
 use HTTP::Status;			# to get http err msg
+use IO::Socket;				# To use unix Sockets
 
 
 use Data::Dumper;
 
 
 my $PROGNAME = basename($0);
-'$Revision: 1.0 $' =~ /^.*(\d+\.\d+) \$$/;  # Use The Revision from RCS/CVS/SVN
+'$Revision: 1.1 $' =~ /^.*(\d+\.\d+) \$$/;  # Use The Revision from RCS/CVS/SVN
 my $VERSION = $1;
 
 my $DEBUG = 0;
@@ -52,10 +75,10 @@ setlocale(LC_MESSAGES, '');
 textdomain('nagios-plugins-perl');
 
 
-my $np = Nagios::Plugin->new(
+my $np = $plugin_module->new(
 	version => $VERSION,
 	blurb => _gt('Plugin to check HAProxy stats url'),
-	usage => "Usage: %s [ -v|--verbose ]  -u <url> [-t <timeout>] [-U <username>] [-P <password>] [ -c|--critical=<threshold> ] [ -w|--warning=<threshold> ]",
+	usage => "Usage: %s [ -v|--verbose ]  -u <url> [-t <timeout>] [-U <username>] [-P <password>] [ -c|--critical=<threshold> ] [ -w|--warning=<threshold> ] [ -b|--critical-backends=<comma separated list> ] [ -i|--ignore-backends=<comma separated list> ]",
 	timeout => $TIMEOUT+1
 );
 $np->add_arg (
@@ -64,14 +87,14 @@ $np->add_arg (
 	default => 0,
 );
 $np->add_arg (
-  spec => 'username|U=s',
-  help => _gt('Username for HTTP Auth'),
-  required => 0, 
+	spec => 'username|U=s',
+	help => _gt('Username for HTTP Auth'),
+	required => 0,
 );
 $np->add_arg (
-  spec => 'password|P=s',
-  help => _gt('Password for HTTP Auth'),
-  required => 0, 
+	spec => 'password|P=s',
+	help => _gt('Password for HTTP Auth'),
+	required => 0,
 );
 $np->add_arg (
 	spec => 'w=f',
@@ -87,8 +110,18 @@ $np->add_arg (
 );
 $np->add_arg (
 	spec => 'url|u=s',
-	help => _gt('URL of the HAProxy csv statistics page.'),
+	help => _gt('URL of the HAProxy csv statistics page HTTP or unix Socket.'),
 	required => 1,
+);
+$np->add_arg (
+	spec => 'critical-backends|b=s',
+	help => _gt('List of critical backend, if set other backend are only warning backend'),
+	required => 0,
+);
+$np->add_arg (
+	spec => 'ignore-backends|i=s',
+	help => _gt('Comma-separated list of backends to ignore'),
+	required => 0,
 );
 
 
@@ -98,6 +131,16 @@ $DEBUG = $np->opts->get('debug');
 my $verbose = $np->opts->get('verbose');
 my $username = $np->opts->get('username');
 my $password = $np->opts->get('password');
+my $crit_backends = $np->opts->get('critical-backends');
+my @crit_backends_list;
+if ( defined ( $crit_backends ) ) {
+	@crit_backends_list = split(',',$crit_backends);
+}
+my $ignore_backends = $np->opts->get('ignore-backends');
+my @ignore_backends_list;
+if ( defined ( $ignore_backends ) ) {
+	@ignore_backends_list = split(',',$ignore_backends);
+}
 
 # Thresholds :
 # time
@@ -117,21 +160,54 @@ $ua->agent(basename($0));
 # Workaround for LWP bug :
 $ua->parse_head(0);
 
-if ( defined($ENV{'http_proxy'}) ) {
-	# Normal http proxy :
-	$ua->proxy(['http'], $ENV{'http_proxy'});
-	# Https must use Crypt::SSLeay https proxy (to use CONNECT method instead of GET)
-	$ENV{'HTTPS_PROXY'} = $ENV{'http_proxy'};
-}
+# For csv data
+my $stats="";
 
-# Build and submit an http request :
-my $request = HTTP::Request->new('GET', $url);
-# Authenticate if username and password are supplied
-if ( defined($username) && defined($password) ) {
-  $request->authorization_basic($username, $password);
-}
 my $timer = time();
-my $http_response = $ua->request( $request );
+if ( $url =~ /^http/ ) {
+	if ( defined($ENV{'http_proxy'}) ) {
+		# Normal http proxy :
+		$ua->proxy(['http'], $ENV{'http_proxy'});
+		# Https must use Crypt::SSLeay https proxy (to use CONNECT method instead of GET)
+		$ENV{'HTTPS_PROXY'} = $ENV{'http_proxy'};
+	}
+	# Build and submit an http request :
+	my $request = HTTP::Request->new('GET', $url);
+	# Authenticate if username and password are supplied
+	if ( defined($username) && defined($password) ) {
+		$request->authorization_basic($username, $password);
+	}
+	my $http_response = $ua->request( $request );
+
+	if ( $http_response->is_error() ) {
+		my $err = $http_response->code." ".status_message($http_response->code)." (".$http_response->message.")";
+		$np->add_message(CRITICAL, _gt("HTTP error: ").$err );
+	} elsif ( ! $http_response->is_success() ) {
+		my $err = $http_response->code." ".status_message($http_response->code)." (".$http_response->message.")";
+		$np->add_message(CRITICAL, _gt("Internal error: ").$err );
+	}
+	if ( $http_response->is_success() ) {
+		$stats = $http_response->content;
+	}
+
+}elsif ( $url =~ /^\// ) {
+	my $sock = new IO::Socket::UNIX (
+		Peer => "$url",
+		Type => SOCK_STREAM,
+		Timeout => 1);
+	if ( !$sock ) {
+		my $err = "Can't connect to unix socket";
+		$np->add_message(CRITICAL, _gt("Internal error: ").$err );
+	}else{
+		print $sock "show stat\n";
+		while(my $line = <$sock>){
+			$stats.=$line;
+		}
+	}
+}else {
+	my $err = "Can't detect socket type";
+	$np->add_message(CRITICAL, _gt("Internal error: ").$err );
+}
 $timer = time()-$timer;
 
 
@@ -158,24 +234,14 @@ if ( $status > OK ) {
 my $message = 'msg';
 
 
-if ( $http_response->is_error() ) {
-	my $err = $http_response->code." ".status_message($http_response->code)." (".$http_response->message.")";
-	$np->add_message(CRITICAL, _gt("HTTP error: ").$err );
-
-} elsif ( ! $http_response->is_success() ) {
-	my $err = $http_response->code." ".status_message($http_response->code)." (".$http_response->message.")";
-	$np->add_message(CRITICAL, _gt("Internal error: ").$err );
-}
 
 
 ($status, $message) = $np->check_messages();
 
-if ( $http_response->is_success() ) {
+if ( $status == OK && $stats ne "") {
 
-	# Get xml content ... 
-	my $stats = $http_response->content;
 	if ($DEBUG) {
-		print "------------------===http output===------------------\n$stats\n-----------------------------------------------------\n";
+		print "------------------===csv output===------------------\n$stats\n-----------------------------------------------------\n";
 		print "t=".$timer."s\n";
 	};
 
@@ -187,7 +253,7 @@ if ( $http_response->is_success() ) {
 	} else {
 		$np->nagios_exit(UNKNOWN, _gt("Can't find csv header !") );
 	}
-	
+
 	my %stats = ();
 	for ( my $y = 1; $y < $#rows; $y++ ) {
 		my @values = split(/\,/,$rows[$y]);
@@ -202,10 +268,16 @@ if ( $http_response->is_success() ) {
 			$stats{$values[0]}{$values[1]}{$fields[$x]} = $values[$x];
 		}
 	}
-#  	print Dumper(\%stats);
+	#print Dumper(\%stats);
 	my %stats2 = ();
 	my $okMsg = '';
 	foreach my $pxname ( keys(%stats) ) {
+		if ( defined($ignore_backends) ) {
+			if ( grep(/^$pxname$/,@ignore_backends_list) ) {
+				logD( sprintf(_gt("Skipping %s because it is defined in ignore list."),$pxname) );
+				next;
+			}
+		}
 		$stats2{$pxname} = {
 			'act' => 0,
 			'acttot' => 0,
@@ -213,6 +285,8 @@ if ( $http_response->is_success() ) {
 			'bcktot' => 0,
 			'scur' => 0,
 			'slim' => 0,
+			'bin' => 0,
+			'bout' => 0,
 			};
 		foreach my $svname ( keys(%{$stats{$pxname}}) ) {
 			if ( $stats{$pxname}{$svname}{'type'} eq '2' ) {
@@ -222,21 +296,31 @@ if ( $http_response->is_success() ) {
 				if ( $stats{$pxname}{$svname}{'status'} eq 'UP' ) {
 					logD( sprintf(_gt("%s '%s' is up on '%s' proxy."),$activeDescr,$svname,$pxname) );
 				} elsif ( $stats{$pxname}{$svname}{'status'} eq 'DOWN' ) {
-					$np->add_message(CRITICAL, sprintf(_gt("%s '%s' is DOWN on '%s' proxy !"),$activeDescr,$svname,$pxname) );
+					if ( defined($crit_backends) ) {
+						if ( grep(/^$pxname$/,@crit_backends_list) ) {
+							$np->add_message(CRITICAL, sprintf(_gt("%s '%s' is DOWN on '%s' proxy !"),$activeDescr,$svname,$pxname) );
+						}else{
+							$np->add_message(WARNING, sprintf(_gt("%s '%s' is DOWN on '%s' proxy !"),$activeDescr,$svname,$pxname) );
+						}
+					}else{
+						$np->add_message(CRITICAL, sprintf(_gt("%s '%s' is DOWN on '%s' proxy !"),$activeDescr,$svname,$pxname) );
+					}
 				}
 				if ( $stats{$pxname}{$svname}{'act'} eq '1' ) {
 					$stats2{$pxname}{'acttot'}++;
 					$stats2{$pxname}{'act'} += $svstatus;
-					
+
 				} elsif ($stats{$pxname}{$svname}{'bck'} eq '1')  {
 					$stats2{$pxname}{'bcktot'}++;
 					$stats2{$pxname}{'bck'} += $svstatus;
 				}
 				$stats2{$pxname}{'scur'} += $stats{$pxname}{$svname}{'scur'};
 				logD( "Current sessions : ".$stats{$pxname}{$svname}{'scur'} );
-				
-			} elsif ( $stats{$pxname}{$svname}{'type'} eq '0' ) {
+
+			} elsif ( $stats{$pxname}{$svname}{'type'} lt '2' ) {
 				$stats2{$pxname}{'slim'} = $stats{$pxname}{$svname}{'slim'};
+				$stats2{$pxname}{'bin'} = $stats{$pxname}{$svname}{'bin'};
+				$stats2{$pxname}{'bout'} = $stats{$pxname}{$svname}{'bout'};
 			}
 		}
 		if ( $stats2{$pxname}{'acttot'} > 0 ) {
@@ -249,26 +333,40 @@ if ( $http_response->is_success() ) {
 				'label' => 'sess_'.$pxname,
 				'value' => $stats2{$pxname}{'scur'},
 				'min' => 0,
-				'uom' => 'sessions',
+				'uom' => '',
 				'max' => $stats2{$pxname}{'slim'},
+			);
+			$np->add_perfdata(
+				'label' => 'bytes_in_'.$pxname,
+				'value' => $stats2{$pxname}{'bin'},
+				'min' => '0',
+				'uom' => 'B',
+				'max' => '',
+			);
+			$np->add_perfdata(
+				'label' => 'bytes_out_'.$pxname,
+				'value' => $stats2{$pxname}{'bout'},
+				'min' => '0',
+				'uom' => 'B',
+				'max' => '',
 			);
 		}
 	}
-	
-#  	print Dumper(\%stats2);
+
+	#print Dumper(\%stats2);
 	($status, $message) = $np->check_messages('join' => ' ');
-	
+
 	if ( $status == OK ) {
 		$message = $okMsg;
-	
+
 	}
-	
+
 }
-# 	if ( $verbose ) {
-# 		($status, $message) = $np->check_messages('join' => '<br/>','join_all' => '<br/>');
-# 	} else {
-# 		($status, $message) = $np->check_messages('join' => '<br/>');
-# 	}
+#	if ( $verbose ) {
+#		($status, $message) = $np->check_messages('join' => '<br/>','join_all' => '<br/>');
+#	} else {
+#		($status, $message) = $np->check_messages('join' => '<br/>');
+#	}
 
 
 $np->nagios_exit($status, $message );
@@ -313,9 +411,22 @@ In F<services.cfg> you just have to add something like :
 	  service_description	HAProxy
 	  check_command			check_haproxy!http://haproxy.exemple.org/haproxy?stats;csv
 	}
+	
+	Or:
+	
+	define service {
+	  host_name             haproxy.exemple.org
+	  normal_check_interval 10
+	  retry_check_interval  5
+	  contact_groups        linux-admins
+	  service_description	HAProxy
+	  check_command			check_haproxy!/var/run/my_haproxy.sock
+	}
 
 =head1 AUTHOR
 
 Stéphane Urbanovski <stephane.urbanovski@ac-nancy-metz.fr>
+David BERARD <david@nfrance.com>
+Claudio Kuenzler <ck@claudiokuenzler.com>
 
 =cut
